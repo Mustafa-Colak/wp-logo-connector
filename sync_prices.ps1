@@ -22,36 +22,95 @@ function Write-Log {
     $logMessage | Out-File -FilePath $config.general.log_file -Append
     
     # Konsola yazdır
-    Write-Host $logMessage
+    if ($level -eq "ERROR") {
+        Write-Host $logMessage -ForegroundColor Red
+    } elseif ($level -eq "WARNING") {
+        Write-Host $logMessage -ForegroundColor Yellow
+    } elseif ($level -eq "SUCCESS") {
+        Write-Host $logMessage -ForegroundColor Green
+    } else {
+        Write-Host $logMessage
+    }
 }
 
-# WooCommerce ürün fiyatını güncelleme fonksiyonu
-function Update-WooCommerceProductPrice {
-    param (
-        [int]$productId,
-        [decimal]$price
-    )
-    
+# Bağlantı test fonksiyonu
+function Test-Connections {
+    # SQL Server bağlantısını test et
     try {
-        $endpoint = "$($config.woocommerce.site_url)/wp-json/wc/v3/products/$productId"
+        Write-Log "SQL Server bağlantısı test ediliyor: $($config.sql.server)..."
+        $connectionString = "Server=$($config.sql.server);Database=$($config.sql.database);User Id=$($config.sql.username);Password=$($config.sql.password);Connection Timeout=5;"
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $connection.Open()
+        $connection.Close()
+        Write-Log "SQL Server bağlantısı başarılı." -level "SUCCESS"
+        $sqlOk = $true
+    } catch {
+        Write-Log "SQL Server bağlantı hatası: $($_.Exception.Message)" -level "ERROR"
+        $sqlOk = $false
+    }
+    
+    # WooCommerce API bağlantısını test et
+    try {
+        Write-Log "WooCommerce API bağlantısı test ediliyor: $($config.woocommerce.site_url)..."
+        $endpoint = "$($config.woocommerce.site_url)/wp-json/wc/v3/products?per_page=1"
         $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($config.woocommerce.consumer_key):$($config.woocommerce.consumer_secret)"))
         
         $headers = @{
             Authorization = "Basic $auth"
         }
         
-        $body = @{
-            regular_price = "$price"
-        } | ConvertTo-Json
-        
-        $response = Invoke-RestMethod -Uri $endpoint -Method PUT -Headers $headers -Body $body -ContentType "application/json"
-        
-        Write-Log "Ürün #$productId fiyatı güncellendi: $price"
-        return $true
+        $response = Invoke-RestMethod -Uri $endpoint -Method GET -Headers $headers -TimeoutSec 10
+        Write-Log "WooCommerce API bağlantısı başarılı." -level "SUCCESS"
+        $wooOk = $true
     } catch {
-        Write-Log "Ürün #$productId fiyat güncellemesi başarısız: $($_.Exception.Message)" -level "ERROR"
-        return $false
+        Write-Log "WooCommerce API bağlantı hatası: $($_.Exception.Message)" -level "ERROR"
+        $wooOk = $false
     }
+    
+    return ($sqlOk -and $wooOk)
+}
+
+# WooCommerce ürün fiyatını güncelleme fonksiyonu (yeniden deneme mekanizması ile)
+function Update-WooCommerceProductPrice {
+    param (
+        [int]$productId,
+        [decimal]$price,
+        [int]$retryCount = $config.general.retry_count,
+        [int]$retryDelay = $config.general.retry_delay
+    )
+    
+    $attempt = 0
+    $success = $false
+    
+    while (-not $success -and $attempt -lt $retryCount) {
+        $attempt++
+        try {
+            $endpoint = "$($config.woocommerce.site_url)/wp-json/wc/v3/products/$productId"
+            $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($config.woocommerce.consumer_key):$($config.woocommerce.consumer_secret)"))
+            
+            $headers = @{
+                Authorization = "Basic $auth"
+            }
+            
+            $body = @{
+                regular_price = "$price"
+            } | ConvertTo-Json
+            
+            $response = Invoke-RestMethod -Uri $endpoint -Method PUT -Headers $headers -Body $body -ContentType "application/json"
+            
+            Write-Log "Ürün #$productId fiyatı güncellendi: $price" -level "SUCCESS"
+            $success = $true
+        } catch {
+            if ($attempt -lt $retryCount) {
+                Write-Log "Ürün #$productId fiyat güncellemesi başarısız (Deneme $attempt/$retryCount): $($_.Exception.Message). $retryDelay saniye sonra tekrar denenecek..." -level "WARNING"
+                Start-Sleep -Seconds $retryDelay
+            } else {
+                Write-Log "Ürün #$productId fiyat güncellemesi başarısız (Son deneme $attempt/$retryCount): $($_.Exception.Message)" -level "ERROR"
+            }
+        }
+    }
+    
+    return $success
 }
 
 # Son senkronizasyon tarihini güncelleme fonksiyonu
@@ -82,7 +141,14 @@ function Update-SyncDate {
 
 # Ana senkronizasyon fonksiyonu
 function Sync-Prices {
-    Write-Log "Seçili ürünlerin fiyat senkronizasyonu başlatılıyor..."
+    $startTime = Get-Date
+    Write-Log "Fiyat senkronizasyonu başlatılıyor... (Sürüm 1.0.1)"
+    
+    # Bağlantıları test et
+    if (-not (Test-Connections)) {
+        Write-Log "Bağlantı testleri başarısız. Senkronizasyon iptal ediliyor." -level "ERROR"
+        return
+    }
     
     try {
         # SQL Server'a bağlan
@@ -109,9 +175,11 @@ function Sync-Prices {
         
         $updatedCount = 0
         $errorCount = 0
+        $totalCount = 0
         
         # Sonuçları işle
         while ($reader.Read()) {
+            $totalCount++
             $sqlProductId = $reader["sql_product_id"]
             $wooProductId = $reader["woo_product_id"]
             $price = $reader["price"]
@@ -133,11 +201,47 @@ function Sync-Prices {
         $reader.Close()
         $connection.Close()
         
-        Write-Log "Fiyat senkronizasyonu tamamlandı. Güncellenen: $updatedCount, Hata: $errorCount"
+        $endTime = Get-Date
+        $duration = ($endTime - $startTime).TotalSeconds
+        
+        Write-Log "Fiyat senkronizasyonu tamamlandı. Toplam: $totalCount, Güncellenen: $updatedCount, Hata: $errorCount (Süre: $duration saniye)" -level "SUCCESS"
     } catch {
         Write-Log "Senkronizasyon hatası: $($_.Exception.Message)" -level "ERROR"
+        Write-Log "Hata detayları: $($_.Exception.StackTrace)" -level "ERROR"
     }
 }
 
-# Script'i çalıştır
-Sync-Prices
+# Test fonksiyonu - Bağlantıları test etmek için
+function Test-Configuration {
+    Write-Log "Yapılandırma testi başlatılıyor..."
+    
+    # Yapılandırma değerlerini kontrol et
+    Write-Log "WooCommerce Site URL: $($config.woocommerce.site_url)"
+    Write-Log "SQL Server: $($config.sql.server)"
+    Write-Log "SQL Database: $($config.sql.database)"
+    Write-Log "Ürün Tablosu: $($config.sql.product_table)"
+    Write-Log "Eşleştirme Tablosu: $($config.sql.sync_table)"
+    Write-Log "Log Dosyası: $($config.general.log_file)"
+    Write-Log "Senkronizasyon Aralığı: $($config.general.sync_interval) dakika"
+    
+    # Bağlantıları test et
+    Test-Connections
+}
+
+# Parametreleri işle
+param (
+    [switch]$Test,
+    [switch]$Verbose
+)
+
+# Verbose modunu ayarla
+if ($Verbose) {
+    $VerbosePreference = "Continue"
+}
+
+# Test veya senkronizasyon işlemini çalıştır
+if ($Test) {
+    Test-Configuration
+} else {
+    Sync-Prices
+}
