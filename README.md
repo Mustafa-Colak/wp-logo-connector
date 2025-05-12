@@ -58,6 +58,7 @@ VALUES
 5. "API anahtarı oluştur" butonuna tıklayın
 6. Oluşturulan "Tüketici Anahtarı" ve "Tüketici Gizli Anahtarı" kaydedin
 
+
 ### 3. Script Dosyalarını Oluşturma
 
 #### PowerShell Yapılandırma Dosyası (config.ps1)

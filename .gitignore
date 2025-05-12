@@ -10,3 +10,6 @@ node_modules/
 
 # Log dosyaları
 *.log
+
+# IDE geçmiş dosyaları
+.history/
