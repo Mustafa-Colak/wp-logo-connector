@@ -1,0 +1,12 @@
+# Hassas bilgiler
+keys.txt
+
+# Sistem dosyaları
+.DS_Store
+Thumbs.db
+
+# Node modülleri (eğer projeniz Node.js kullanıyorsa)
+node_modules/
+
+# Log dosyaları
+*.log
